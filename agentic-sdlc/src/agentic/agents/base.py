@@ -167,36 +167,3 @@ def make_node_executor(agent: Agent, run_id: str):
         return NodeExecutionResult(artifacts=result.artifacts, decisions=result.decisions)
 
     return _executor
-
-
-def _build_agent_registry() -> dict[str, type[Agent]]:
-    from agentic.agents.ambiguity import AmbiguityAgent
-    from agentic.agents.api_contract import ApiContractAgent
-    from agentic.agents.architect import ArchitectAgent
-    from agentic.agents.codebase_analyst import CodebaseAnalystAgent
-    from agentic.agents.data_model import DataModelAgent
-    from agentic.agents.implementer import ImplementerAgent
-    from agentic.agents.planner import PlannerAgent
-    from agentic.agents.release_manager import ReleaseManagerAgent
-    from agentic.agents.requirements import RequirementsAgent
-    from agentic.agents.security_reviewer import SecurityReviewerAgent
-    from agentic.agents.technical_writer import TechnicalWriterAgent
-    from agentic.agents.test_engineer import TestEngineerAgent
-
-    return {
-        "requirements": RequirementsAgent,
-        "ambiguity": AmbiguityAgent,
-        "planner": PlannerAgent,
-        "codebase_analyst": CodebaseAnalystAgent,
-        "architect": ArchitectAgent,
-        "data_model": DataModelAgent,
-        "api_contract": ApiContractAgent,
-        "implementer": ImplementerAgent,
-        "test_engineer": TestEngineerAgent,
-        "security_reviewer": SecurityReviewerAgent,
-        "technical_writer": TechnicalWriterAgent,
-        "release_manager": ReleaseManagerAgent,
-    }
-
-
-AGENT_REGISTRY: dict[str, type[Agent]] = _build_agent_registry()

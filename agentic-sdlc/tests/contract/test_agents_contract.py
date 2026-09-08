@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic.agents.base import AGENT_REGISTRY
+from agentic.agents.registry import AGENT_REGISTRY
 from agentic.core.context import ContextView
 from agentic.llm.mock import MockProvider, ScriptedResponse
 from agentic.tools.fs import JailedFS

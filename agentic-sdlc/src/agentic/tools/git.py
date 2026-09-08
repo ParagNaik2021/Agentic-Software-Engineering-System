@@ -11,6 +11,11 @@ from pathlib import Path
 
 import git
 
+_DEFAULT_GITIGNORE = (
+    "__pycache__/\n*.pyc\n.pytest_cache/\n.pytest-tmp/\n.coverage\n"
+    ".ruff_cache/\n.mypy_cache/\nhtmlcov/\n.venv/\n"
+)
+
 
 class GitCheckpointer:
     def __init__(self, repo_path: Path) -> None:
@@ -23,7 +28,12 @@ class GitCheckpointer:
         """Commit the current tree (including untracked files) and
         return the commit sha. If nothing changed since the last
         checkpoint, returns the current HEAD sha without an empty
-        commit."""
+        commit. Seeds a default .gitignore (build/cache artifacts) on
+        the first checkpoint if the workspace didn't already have one,
+        so generated caches never pollute the committed baseline."""
+        gitignore_path = self.repo_path / ".gitignore"
+        if not gitignore_path.exists():
+            gitignore_path.write_text(_DEFAULT_GITIGNORE, encoding="utf-8")
         self.repo.git.add(A=True)
         if self.repo.is_dirty(index=True, working_tree=True, untracked_files=True):
             commit = self.repo.index.commit(f"checkpoint: {label}")

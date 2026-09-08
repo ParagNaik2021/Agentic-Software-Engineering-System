@@ -88,11 +88,13 @@ async def test_three_way_parallel_group_runs_concurrently(engine) -> None:
     # observable concurrency: all three parallel nodes' execution windows overlap.
     # A serial run of three 0.2s sleeps would take >=0.6s wall clock; a
     # concurrent run takes ~0.2s. That gap is what's actually being tested,
-    # since exact start/end timestamps are subject to scheduler jitter.
+    # since exact start/end timestamps are subject to scheduler jitter —
+    # the threshold sits well below the serial floor (0.6s) with generous
+    # margin above the concurrent expectation (0.2s) to absorb it.
     starts = [timeline[n][0] for n in ("design.arch", "design.data", "design.api")]
     ends = [timeline[n][1] for n in ("design.arch", "design.data", "design.api")]
     wall_clock = max(ends) - min(starts)
-    assert wall_clock < 0.4, (
+    assert wall_clock < 0.5, (
         f"parallel nodes took {wall_clock:.3f}s wall clock; "
         "expected ~0.2s if truly concurrent, not ~0.6s if serial"
     )

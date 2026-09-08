@@ -60,6 +60,39 @@ def _fmt_dt(dt) -> str:
     return dt.isoformat() if dt is not None else "-"
 
 
+def reconstruct_approvals_from_events(events: list[Event]) -> list[ApprovalRecord]:
+    """A live ApprovalManager doesn't survive a CLI process boundary
+    (`agentic report` runs fresh each time), but APPROVAL_REQUESTED/
+    GRANTED/REJECTED events do — rebuild the record list from them so
+    the report is correct without a live governance object."""
+    records: dict[str, ApprovalRecord] = {}
+    for event in events:
+        if event.type == EventType.APPROVAL_REQUESTED and event.node_id:
+            records[event.node_id] = ApprovalRecord(
+                node_id=event.node_id, input_hash=event.payload.get("input_hash", ""),
+                status="PENDING", requested_at=event.ts,
+            )
+        elif event.type == EventType.APPROVAL_GRANTED and event.node_id:
+            record = records.get(event.node_id) or ApprovalRecord(
+                node_id=event.node_id, input_hash=event.payload.get("input_hash", ""), status="PENDING",
+            )
+            record.status = "GRANTED"
+            record.approver = event.actor.id
+            record.note = event.payload.get("note", "")
+            record.decided_at = event.ts
+            records[event.node_id] = record
+        elif event.type == EventType.APPROVAL_REJECTED and event.node_id:
+            record = records.get(event.node_id) or ApprovalRecord(
+                node_id=event.node_id, input_hash="", status="PENDING",
+            )
+            record.status = "REJECTED"
+            record.approver = event.actor.id
+            record.note = event.payload.get("note", "")
+            record.decided_at = event.ts
+            records[event.node_id] = record
+    return list(records.values())
+
+
 def _gate_events(events: list[Event]) -> list[Event]:
     return [e for e in events if e.type == EventType.GATE_EVALUATED]
 

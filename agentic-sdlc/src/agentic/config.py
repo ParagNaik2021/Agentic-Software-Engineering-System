@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,7 +44,7 @@ class Settings(BaseSettings):
     llm_model: str = "claude-sonnet-5"
     llm_temperature: float = 0.2
     llm_max_tokens: int = 4096
-    replay_on_miss: str = "error"  # "error" | "live"
+    replay_on_miss: Literal["error", "live"] = "error"
     anthropic_api_key: str | None = None
 
     # --- budgets ---

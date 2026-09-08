@@ -178,28 +178,46 @@ def _cond_artifact_produced(ctx: GateContext, params: dict) -> tuple[GateVerdict
     return GateVerdict.PASS_, "all declared output artifacts produced"
 
 
+def _upstream_payload(ctx: GateContext, artifact_name: str) -> dict | None:
+    """Fallback for join-style nodes (e.g. verify.gate) that have no
+    test_results/security_findings of their own on GateContext but sit
+    downstream of a node that produced an artifact by that name — read
+    it from the node's context view instead of requiring the engine to
+    thread it through explicitly."""
+    artifact = ctx.context.view_for(ctx.node.node_id).get(artifact_name)
+    if artifact is None or not isinstance(artifact.payload, dict):
+        return None
+    return artifact.payload
+
+
 def _cond_tests_pass(ctx: GateContext, params: dict) -> tuple[GateVerdict, str]:
-    if ctx.test_results is None:
+    results = ctx.test_results if ctx.test_results is not None else _upstream_payload(ctx, "test_results")
+    if results is None:
         return GateVerdict.PASS_, "no test execution associated with this node"
-    if ctx.test_results.get("exit_code", 0) == 0:
+    if results.get("exit_code", 0) == 0:
         return GateVerdict.PASS_, "tests passed"
     return GateVerdict.FAIL, "test execution returned a non-zero exit code"
 
 
 def _cond_coverage_threshold(ctx: GateContext, params: dict) -> tuple[GateVerdict, str]:
-    if ctx.test_results is None or "coverage" not in ctx.test_results:
+    results = ctx.test_results if ctx.test_results is not None else _upstream_payload(ctx, "test_results")
+    if results is None or "coverage" not in results:
         return GateVerdict.PASS_, "no coverage data associated with this node"
     floor = params.get("floor", 0.80)
-    coverage = ctx.test_results["coverage"]
+    coverage = results["coverage"]
     if coverage >= floor:
         return GateVerdict.PASS_, f"coverage {coverage:.0%} meets floor {floor:.0%}"
     return GateVerdict.FAIL, f"coverage {coverage:.0%} below floor {floor:.0%}"
 
 
 def _cond_no_high_findings(ctx: GateContext, params: dict) -> tuple[GateVerdict, str]:
-    if not ctx.security_findings:
+    findings = ctx.security_findings
+    if findings is None:
+        payload = _upstream_payload(ctx, "security_findings")
+        findings = payload.get("findings") if isinstance(payload, dict) else None
+    if not findings:
         return GateVerdict.PASS_, "no security findings"
-    high = [f for f in ctx.security_findings if f.get("severity") in ("HIGH", "CRITICAL")]
+    high = [f for f in findings if f.get("severity") in ("HIGH", "CRITICAL")]
     if high:
         return GateVerdict.FAIL, f"{len(high)} HIGH/CRITICAL security finding(s)"
     return GateVerdict.PASS_, "no HIGH/CRITICAL security findings"

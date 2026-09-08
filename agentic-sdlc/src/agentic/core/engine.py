@@ -5,18 +5,31 @@ settlement, and pause/resume across human approval checkpoints
 Node execution is injected via `node_executors`: a mapping from node_id
 to an async callable. Real agents (P6) populate this from the agent
 registry; until then, and in every test, small deterministic stub
-executors stand in for them.
+executors stand in for them. `executors_by_agent` is a fallback keyed
+by NodeSpec.agent instead of node_id, for dynamically-expanded nodes
+(e.g. every impl.<task_id> node shares agent="implementer") whose exact
+node_id cannot be registered before the graph is expanded mid-run.
 
 Every status change goes through _transition(), which emits the
 NODE_STATE_CHANGED event *before* mutating in-memory state, and derives
 started_at/ended_at/duration_ms from the event's own timestamp — the
 same derivation events.replay_to_state() performs — so a live run and a
 replayed run agree exactly.
+
+When a node ends FAILED and a RecoveryManager is configured, _recover()
+classifies the failure and re-executes it in place (retry/fallback) or
+reverts it (rollback) via `rollback_handlers[node_id]` — a workflow-
+supplied callable, since only the workflow knows what "revert" means
+for a given node (e.g. git-reset to a prior checkpoint). A node left
+ROLLED_BACK is not retried automatically; its downstream nodes stay
+BLOCKED, which the next tick's deadlock check turns into a safe-stop —
+the "escalate to a human" Section 6.4 describes for this path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
@@ -39,9 +52,27 @@ from agentic.core.models import (
 from agentic.core.replan import ReplanBudgetExceeded, ReplanController
 from agentic.core.states import NodeStatus, assert_transition
 from agentic.core.store import RunStore
+from agentic.governance.recovery import RecoveryManager
+from agentic.llm.provider import MalformedOutputError, QualityFaultError, TransientProviderError
 
 SYSTEM = Actor(kind="system", id="engine")
 APPROVER = Actor(kind="human", id="approver")
+
+
+def _classify_exception(exc: BaseException) -> ErrorClass:
+    """Section 6.4's error classification for exceptions raised during
+    execution (as opposed to exit-gate FAIL, classified in _settle as
+    QUALITY_FAILURE). The three named exception types are the fault
+    profiles a provider can raise (llm/provider.py, Section 9.3);
+    anything else is SYSTEMIC — safe-stop rather than a blind retry,
+    since an unclassified exception's retry-safety is unknown."""
+    if isinstance(exc, TransientProviderError):
+        return ErrorClass.TRANSIENT
+    if isinstance(exc, MalformedOutputError):
+        return ErrorClass.MALFORMED_OUTPUT
+    if isinstance(exc, QualityFaultError):
+        return ErrorClass.QUALITY_FAILURE
+    return ErrorClass.SYSTEMIC
 
 _CANDIDATE_STATUSES = (
     NodeStatus.PENDING,
@@ -65,6 +96,15 @@ class NodeExecutionResult:
 
 NodeExecutor = Callable[[NodeSpec, ContextView], Awaitable[NodeExecutionResult]]
 
+GraphExpander = Callable[[WorkflowGraph, ContextView], list[str]]
+"""Section 5.1: impl.<task_id> nodes are "dynamically expanded, one node
+per task in task_graph". An expander is keyed by the node_id whose
+success triggers it (e.g. "plan.decompose"); it mutates the graph in
+place (adding new NodeSpecs, and may patch an existing node's
+depends_on — e.g. impl.join's — to point at what it just added) and
+returns the newly added node_ids so the engine can seed their NodeRun
+entries."""
+
 
 async def _default_control_executor(node: NodeSpec, view: ContextView) -> NodeExecutionResult:
     """Control nodes (agent is None: intake, joins, ...) do no work of
@@ -82,7 +122,11 @@ class Engine:
         event_log: EventLog,
         store: RunStore,
         node_executors: dict[str, NodeExecutor] | None = None,
+        executors_by_agent: dict[str, NodeExecutor] | None = None,
+        graph_expanders: dict[str, GraphExpander] | None = None,
         gates: GateEvaluator | None = None,
+        recovery: RecoveryManager | None = None,
+        rollback_handlers: dict[str, Callable[[], object]] | None = None,
         concurrency: int = 4,
         replan_budget: int = 3,
     ) -> None:
@@ -92,7 +136,11 @@ class Engine:
         self.events = event_log
         self.store = store
         self.node_executors = node_executors or {}
+        self.executors_by_agent = executors_by_agent or {}
+        self.graph_expanders = graph_expanders or {}
         self.gates = gates or GateEvaluator()
+        self.recovery = recovery
+        self.rollback_handlers = rollback_handlers or {}
         self.semaphore = asyncio.Semaphore(concurrency)
         self.replan = ReplanController(budget=replan_budget)
         self.granted_approvals: dict[str, str] = {}
@@ -148,14 +196,56 @@ class Engine:
         **kwargs,
     ) -> Engine:
         """Rebuild an Engine in a fresh process: replay the event log into
-        RunState and rehydrate artifact content from context.persist_dir."""
+        RunState, rehydrate artifact content from context.persist_dir,
+        reconstruct granted_approvals from APPROVAL_GRANTED events (it is
+        in-memory only on a live Engine and would otherwise vanish across
+        the process boundary this method exists to cross), and re-apply
+        any graph_expanders whose trigger node already succeeded — a
+        fresh graph object never saw the mutation the original process's
+        expander made, so it must be redone against this graph. The
+        resulting node_ids already exist in the replayed RunState, so no
+        duplicate NodeRun entries are created; callers must pass a fresh
+        WorkflowGraph instance to resume(), never one already expanded."""
         engine = cls(run_id, graph, context, event_log, store, **kwargs)
         context.load_from_disk()
         engine.state = store.resume(run_id, event_log)
+
+        for event in event_log.read():
+            if event.type == EventType.APPROVAL_GRANTED and event.node_id:
+                input_hash = event.payload.get("input_hash")
+                if isinstance(input_hash, str):
+                    engine.granted_approvals[event.node_id] = input_hash
+            elif event.type == EventType.APPROVAL_REJECTED and event.node_id:
+                engine.granted_approvals.pop(event.node_id, None)
+
+        for trigger_node_id, expander in engine.graph_expanders.items():
+            node_run = engine.state.nodes.get(trigger_node_id)
+            if node_run is None or node_run.status != NodeStatus.SUCCEEDED:
+                continue
+            view = context.view_for(trigger_node_id)
+            for artifact_id in node_run.produced:
+                artifact = context.get_by_id(artifact_id)
+                if artifact is not None:
+                    view.artifacts[artifact.name] = artifact
+            expander(graph, view)
         return engine
 
     def trigger_replan(self, changed_node_id: str) -> None:
         self.replan.request(changed_node_id)
+
+    def replan_now(self, changed_node_id: str) -> None:
+        """Queues and immediately applies a re-plan, then persists —
+        `agentic replan` must do this within one process invocation,
+        since ReplanController's queue is in-memory only and would not
+        survive to a later `agentic resume` in a fresh process."""
+        self.trigger_replan(changed_node_id)
+        self._apply_replan()
+        self.store.save(self._state)
+
+    def halt(self, reason: str = "operator halt") -> RunState:
+        """Public wrapper for `agentic halt <run_id>` (Section 6.4:
+        "Safe-stop is reachable by ... an operator command")."""
+        return self._safe_stop(reason)
 
     # ------------------------------------------------------------------
     # main loop (Section 5.3)
@@ -191,6 +281,7 @@ class Engine:
             )
             for node_id, outcome in zip(approved, results, strict=True):
                 await self._settle(node_id, outcome)
+                await self._recover(node_id)
 
             if self.replan.pending():
                 try:
@@ -203,10 +294,20 @@ class Engine:
     # ------------------------------------------------------------------
     # readiness / approval
     # ------------------------------------------------------------------
+    def _node_run(self, node_id: str) -> NodeRun:
+        """Nodes added by a GraphExpander mid-run are seeded into
+        state.nodes at expansion time, but this stays defensive so
+        ready-set computation never KeyErrors on a graph/state gap."""
+        node_run = self._state.nodes.get(node_id)
+        if node_run is None:
+            node_run = NodeRun(node_id=node_id, run_id=self.run_id, status=NodeStatus.PENDING)
+            self._state.nodes[node_id] = node_run
+        return node_run
+
     def _ready_set(self) -> list[str]:
         ready = []
         for node_id in self.graph.node_ids:
-            node_run = self._state.nodes[node_id]
+            node_run = self._node_run(node_id)
             if node_run.status not in _CANDIDATE_STATUSES:
                 continue
             ctx = GateContext(
@@ -223,7 +324,7 @@ class Engine:
 
     def _all_settled(self) -> bool:
         terminal = {NodeStatus.SUCCEEDED, NodeStatus.SKIPPED}
-        return all(nr.status in terminal for nr in self._state.nodes.values())
+        return all(self._node_run(node_id).status in terminal for node_id in self.graph.node_ids)
 
     def _has_pending_approval(self) -> bool:
         return any(nr.status == NodeStatus.AWAITING_APPROVAL for nr in self._state.nodes.values())
@@ -279,8 +380,13 @@ class Engine:
     async def _execute_node(self, node_id: str) -> NodeExecutionResult:
         input_hash = self.context.input_hash(node_id)
         self._transition(node_id, NodeStatus.RUNNING, extra_payload={"input_hash": input_hash})
+        self._state.nodes[node_id].attempt += 1
         node = self.graph[node_id]
-        executor = self.node_executors.get(node_id, _default_control_executor)
+        executor = self.node_executors.get(node_id)
+        if executor is None and node.agent:
+            executor = self.executors_by_agent.get(node.agent)
+        if executor is None:
+            executor = _default_control_executor
         async with self.semaphore:
             if node.agent:
                 self.events.append(
@@ -297,7 +403,7 @@ class Engine:
         node_run = self._state.nodes[node_id]
 
         if isinstance(outcome, BaseException):
-            node_run.error = ErrorRecord(error_class=ErrorClass.SYSTEMIC, message=str(outcome))
+            node_run.error = ErrorRecord(error_class=_classify_exception(outcome), message=str(outcome))
             self._transition(node_id, NodeStatus.FAILED)
             return
 
@@ -321,12 +427,25 @@ class Engine:
                 payload={"decision_id": decision.decision_id},
             )
 
+        own_test_results = None
+        own_security_findings = None
+        for artifact_id in node_run.produced:
+            produced_artifact = self.context.get_by_id(artifact_id)
+            if produced_artifact is None or not isinstance(produced_artifact.payload, dict):
+                continue
+            if produced_artifact.name == "test_results":
+                own_test_results = produced_artifact.payload
+            elif produced_artifact.name == "security_findings":
+                own_security_findings = produced_artifact.payload.get("findings")
+
         exit_ctx = GateContext(
             node=node,
             graph=self.graph,
             context=self.context,
             run_state=self._state,
             node_run=node_run,
+            test_results=own_test_results,
+            security_findings=own_security_findings,
         )
         exit_results = self.gates.evaluate_exit(exit_ctx)
         node_run.gate_results.extend(exit_results)
@@ -336,9 +455,91 @@ class Engine:
             )
 
         if aggregate(exit_results) == GateVerdict.FAIL:
+            failing = [r for r in exit_results if r.verdict == GateVerdict.FAIL]
+            node_run.error = ErrorRecord(
+                error_class=ErrorClass.QUALITY_FAILURE,
+                message="; ".join(f"{r.condition}: {r.message}" for r in failing),
+            )
             self._transition(node_id, NodeStatus.FAILED)
         else:
             self._transition(node_id, NodeStatus.SUCCEEDED)
+            self._expand_graph_if_needed(node_id)
+
+    def _expand_graph_if_needed(self, node_id: str) -> None:
+        expander = self.graph_expanders.get(node_id)
+        if expander is None:
+            return
+        view = self.context.view_for(node_id)
+        # a successful node's own artifacts are upstream of nothing but
+        # itself in view_for's sense; the expander needs to see what
+        # this node just produced too, so extend the view with it.
+        for artifact_id in self._state.nodes[node_id].produced:
+            artifact = self.context.get_by_id(artifact_id)
+            if artifact is not None:
+                view.artifacts[artifact.name] = artifact
+        new_node_ids = expander(self.graph, view)
+        for new_id in new_node_ids:
+            if new_id not in self._state.nodes:
+                self._state.nodes[new_id] = NodeRun(node_id=new_id, run_id=self.run_id, status=NodeStatus.PENDING)
+
+    # ------------------------------------------------------------------
+    # recovery (Section 6.4)
+    # ------------------------------------------------------------------
+    async def _recover(self, node_id: str) -> None:
+        """Loops retry/fallback re-executions in place; a rollback or
+        safe-stop decision ends the loop (rollback leaves the node
+        ROLLED_BACK — not retried again automatically)."""
+        if self.recovery is None:
+            return
+        node = self.graph[node_id]
+        while self._state.nodes[node_id].status == NodeStatus.FAILED:
+            node_run = self._state.nodes[node_id]
+            error_class = node_run.error.error_class if node_run.error else ErrorClass.SYSTEMIC
+            decision = self.recovery.decide(error_class, node_run.attempt, node.retry, node.fallback)
+
+            if decision.strategy == "retry":
+                self.events.append(
+                    EventType.RETRY_SCHEDULED, SYSTEM, node_id=node_id,
+                    payload={"reason": decision.reason, "delay_seconds": decision.delay_seconds},
+                )
+                self._state.metrics.retries += 1
+                self._transition(node_id, NodeStatus.RETRYING)
+                if decision.delay_seconds:
+                    await asyncio.sleep(decision.delay_seconds)
+                await self._reexecute_and_settle(node_id)
+            elif decision.strategy == "fallback":
+                self.events.append(
+                    EventType.FALLBACK_ENGAGED, SYSTEM, node_id=node_id, payload={"reason": decision.reason}
+                )
+                self._transition(node_id, NodeStatus.FALLBACK)
+                await self._reexecute_and_settle(node_id)
+            elif decision.strategy == "rollback":
+                await self._perform_rollback(node_id, decision.reason)
+                return
+            elif decision.strategy == "safe_stop":
+                self._safe_stop(decision.reason)
+                return
+            else:
+                return
+
+    async def _reexecute_and_settle(self, node_id: str) -> None:
+        try:
+            outcome: NodeExecutionResult | BaseException = await self._execute_node(node_id)
+        except BaseException as exc:  # noqa: BLE001 - captured as a settlement outcome, not re-raised
+            outcome = exc
+        await self._settle(node_id, outcome)  # _settle itself expands the graph on success
+
+    async def _perform_rollback(self, node_id: str, reason: str) -> None:
+        self._transition(node_id, NodeStatus.ROLLING_BACK)
+        self.events.append(EventType.ROLLBACK_STARTED, SYSTEM, node_id=node_id, payload={"reason": reason})
+        handler = self.rollback_handlers.get(node_id)
+        if handler is not None:
+            result = handler()
+            if inspect.isawaitable(result):
+                await result
+        self._transition(node_id, NodeStatus.ROLLED_BACK)
+        self._state.metrics.rollbacks += 1
+        self.events.append(EventType.ROLLBACK_COMPLETED, SYSTEM, node_id=node_id, payload={"reason": reason})
 
     # ------------------------------------------------------------------
     # re-planning

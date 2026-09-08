@@ -52,13 +52,37 @@ class ContextStore:
         self._by_name: dict[str, list[Artifact]] = {}
         self._decisions: dict[str, Decision] = {}
         self._decisions_by_node: dict[str, list[Decision]] = {}
+        self._sequence: dict[str, int] = {}  # artifact_id -> insertion order, tiebreaks equal versions
+        self._next_seq = 0
         self.persist_dir = persist_dir
         if persist_dir is not None:
             persist_dir.mkdir(parents=True, exist_ok=True)
+            self._decisions_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def _decisions_dir(self) -> Path:
+        assert self.persist_dir is not None
+        return self.persist_dir / "decisions"
+
+    def _latest(self, candidates: list[Artifact]) -> Artifact:
+        """Highest version wins; among equal versions (agents do not
+        always bump version on regeneration after a re-plan), the one
+        with the latest created_at wins — plain max() would silently
+        return whichever came first in insertion order on a tie.
+        created_at (persisted data) breaks ties correctly even after a
+        resume rehydrates from disk in file-glob order; the in-process
+        sequence counter is a final tiebreak for same-timestamp writes
+        within a single run."""
+        return max(
+            candidates,
+            key=lambda a: (a.version, a.created_at, self._sequence.get(a.artifact_id, -1)),
+        )
 
     def put(self, artifact: Artifact) -> str:
         self._by_id[artifact.artifact_id] = artifact
         self._by_name.setdefault(artifact.name, []).append(artifact)
+        self._sequence[artifact.artifact_id] = self._next_seq
+        self._next_seq += 1
         if self.persist_dir is not None:
             path = self.persist_dir / f"{artifact.artifact_id}.json"
             path.write_text(artifact.model_dump_json(), encoding="utf-8")
@@ -79,13 +103,20 @@ class ContextStore:
             artifact = Artifact.model_validate_json(path.read_text(encoding="utf-8"))
             self._by_id[artifact.artifact_id] = artifact
             self._by_name.setdefault(artifact.name, []).append(artifact)
+            self._sequence[artifact.artifact_id] = self._next_seq
+            self._next_seq += 1
+        if self._decisions_dir.exists():
+            for path in sorted(self._decisions_dir.glob("*.json")):
+                decision = Decision.model_validate_json(path.read_text(encoding="utf-8"))
+                self._decisions[decision.decision_id] = decision
+                self._decisions_by_node.setdefault(decision.node_id, []).append(decision)
 
     def get(self, name: str, version: int | None = None) -> Artifact:
         versions = self._by_name.get(name)
         if not versions:
             raise KeyError(f"no artifact named '{name}'")
         if version is None:
-            return max(versions, key=lambda a: a.version)
+            return self._latest(versions)
         for a in versions:
             if a.version == version:
                 return a
@@ -94,18 +125,31 @@ class ContextStore:
     def view_for(self, node_id: str) -> ContextView:
         """Only artifacts produced by nodes in node_id's transitive
         upstream, latest version per name. Prevents context bleed and
-        makes input_hash meaningful."""
+        makes input_hash meaningful.
+
+        Iterates names in sorted order deliberately: `_by_name`'s key
+        order otherwise reflects insertion order, which is chronological
+        in a live run but effectively arbitrary (sorted by artifact-id
+        filename) after load_from_disk() rehydrates a resumed process.
+        An agent whose prompt serializes `ctx.artifacts.keys()` would
+        then build a different prompt — and a different request_hash —
+        after resume than during the original run. Sorting makes the
+        view's key order a pure function of *what* is present, not the
+        order it arrived in."""
         upstream = self._graph.upstream_of(node_id)
         view: dict[str, Artifact] = {}
-        for name, versions in self._by_name.items():
-            candidates = [a for a in versions if a.produced_by_node in upstream]
+        for name in sorted(self._by_name):
+            candidates = [a for a in self._by_name[name] if a.produced_by_node in upstream]
             if candidates:
-                view[name] = max(candidates, key=lambda a: a.version)
+                view[name] = self._latest(candidates)
         return ContextView(artifacts=view)
 
     def record_decision(self, d: Decision) -> str:
         self._decisions[d.decision_id] = d
         self._decisions_by_node.setdefault(d.node_id, []).append(d)
+        if self.persist_dir is not None:
+            path = self._decisions_dir / f"{d.decision_id}.json"
+            path.write_text(d.model_dump_json(), encoding="utf-8")
         return d.decision_id
 
     def lineage(self, artifact_id: str) -> LineageGraph:

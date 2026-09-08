@@ -1,0 +1,80 @@
+{
+  "2d61bae0f7a70266bc45f64dae107a75379020adee2b4f63cd323cc6d0dc7be5": {
+    "content": "{\"components\": [\"services\"], \"boundaries\": \"Caching and aggregation live in the service layer.\", \"cross_cutting_concerns\": [], \"decisions\": [{\"statement\": \"Add an in-process LRU redirect cache and a daily click-count aggregate, sized against the proposed 200ms default.\", \"rationale\": \"No clarification received yet; proceeding on the ambiguity agent's proposed defaults so work is not blocked.\", \"alternatives_rejected\": [\"waiting indefinitely for a human answer before doing any work\"]}]}",
+    "latency_ms": 0,
+    "model": "claude-sonnet-5",
+    "parsed": null,
+    "request_hash": "2d61bae0f7a70266bc45f64dae107a75379020adee2b4f63cd323cc6d0dc7be5",
+    "tokens": {
+      "completion_tokens": 0,
+      "cost_usd": 0.0,
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  "374b81b54cf1324fa608e98145a4756a4b03416e6e6afec158e5e3d03a124344": {
+    "content": "{\"components\": [\"services\"], \"boundaries\": \"Caching, index tuning and the extended analytics aggregation live in the service layer.\", \"cross_cutting_concerns\": [\"geo/device lookup on click events\"], \"decisions\": [{\"statement\": \"Size the redirect cache and index tuning for p95 < 50ms; extend click analytics with geographic and device dimensions.\", \"rationale\": \"Directly addresses the answered clarification rather than the earlier generic default.\", \"alternatives_rejected\": [\"keeping the 200ms default target\", \"daily-count-only analytics\"]}]}",
+    "latency_ms": 0,
+    "model": "claude-sonnet-5",
+    "parsed": null,
+    "request_hash": "374b81b54cf1324fa608e98145a4756a4b03416e6e6afec158e5e3d03a124344",
+    "tokens": {
+      "completion_tokens": 0,
+      "cost_usd": 0.0,
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  "37abcef2e6c3fcd3a823cb9f4b164b4ee5437889c4eb417dc07695ebc6bb95d9": {
+    "content": "{\"normalized_spec\": \"Make the redirect path faster and provide better click analytics. No target metric or dimensions specified.\", \"acceptance_criteria\": [{\"id\": \"AC-1\", \"statement\": \"Redirect latency is measurably improved.\", \"testable\": true}, {\"id\": \"AC-2\", \"statement\": \"Click analytics provide more than a raw count.\", \"testable\": true}], \"ambiguity_register\": [{\"id\": \"AMB-1\", \"description\": \"No target latency specified.\", \"assumption_if_unresolved\": \"Target p95 under 200ms.\"}, {\"id\": \"AMB-2\", \"description\": \"Unclear which path must be faster (redirect vs create).\", \"assumption_if_unresolved\": \"Assume the redirect path.\"}, {\"id\": \"AMB-3\", \"description\": \"Unclear if throughput or latency is the concern.\", \"assumption_if_unresolved\": \"Assume latency.\"}, {\"id\": \"AMB-4\", \"description\": \"No analytics dimensions specified.\", \"assumption_if_unresolved\": \"Add daily click-count aggregation only.\"}, {\"id\": \"AMB-5\", \"description\": \"No time range specified for analytics.\", \"assumption_if_unresolved\": \"Last 30 days.\"}, {\"id\": \"AMB-6\", \"description\": \"Unclear what infrastructure changes are acceptable.\", \"assumption_if_unresolved\": \"In-process changes only, no new infra.\"}]}",
+    "latency_ms": 0,
+    "model": "claude-sonnet-5",
+    "parsed": null,
+    "request_hash": "37abcef2e6c3fcd3a823cb9f4b164b4ee5437889c4eb417dc07695ebc6bb95d9",
+    "tokens": {
+      "completion_tokens": 0,
+      "cost_usd": 0.0,
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  "48b1534def29a4ac6660aef2e7dc792dfb35cc34a8c59623bd91cc56562ba35e": {
+    "content": "{\"scored\": [{\"id\": \"AMB-1\", \"question\": \"What p95 redirect latency target should we hit?\", \"proposed_default\": \"200ms.\", \"impact\": 0.9, \"uncertainty\": 0.8}, {\"id\": \"AMB-2\", \"question\": \"Which path should be optimized: redirect or creation?\", \"proposed_default\": \"Redirect.\", \"impact\": 0.7, \"uncertainty\": 0.8}, {\"id\": \"AMB-3\", \"question\": \"Is this about latency or throughput?\", \"proposed_default\": \"Latency.\", \"impact\": 0.3, \"uncertainty\": 0.4}, {\"id\": \"AMB-4\", \"question\": \"What analytics dimensions matter (geography, device, referrer)?\", \"proposed_default\": \"Daily click counts only.\", \"impact\": 0.8, \"uncertainty\": 0.7}, {\"id\": \"AMB-5\", \"question\": \"What time range should analytics cover?\", \"proposed_default\": \"Last 30 days.\", \"impact\": 0.3, \"uncertainty\": 0.3}, {\"id\": \"AMB-6\", \"question\": \"Are new infrastructure components acceptable?\", \"proposed_default\": \"No, in-process only.\", \"impact\": 0.2, \"uncertainty\": 0.3}], \"above_threshold_ids\": [\"AMB-1\", \"AMB-2\", \"AMB-4\"], \"assumptions\": [\"This is a latency concern, not throughput.\", \"Analytics cover the last 30 days.\", \"No new infrastructure components; in-process changes only.\"]}",
+    "latency_ms": 0,
+    "model": "claude-sonnet-5",
+    "parsed": null,
+    "request_hash": "48b1534def29a4ac6660aef2e7dc792dfb35cc34a8c59623bd91cc56562ba35e",
+    "tokens": {
+      "completion_tokens": 0,
+      "cost_usd": 0.0,
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  "cd83c444bce47affadc7c34b67539ee7ca47da973dece741c54ae1b755bdcc85": {
+    "content": "{\"tasks\": [{\"task_id\": \"T1\", \"description\": \"Add redirect-path caching and index tuning to meet p95 < 50ms.\", \"depends_on\": [], \"file_scope\": [\"app/service.py\"], \"effort\": \"L\", \"risk\": \"medium\"}, {\"task_id\": \"T2\", \"description\": \"Add geographic and device-type breakdown to click analytics.\", \"depends_on\": [], \"file_scope\": [\"app/service.py\"], \"effort\": \"M\", \"risk\": \"low\"}]}",
+    "latency_ms": 0,
+    "model": "claude-sonnet-5",
+    "parsed": null,
+    "request_hash": "cd83c444bce47affadc7c34b67539ee7ca47da973dece741c54ae1b755bdcc85",
+    "tokens": {
+      "completion_tokens": 0,
+      "cost_usd": 0.0,
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  },
+  "dde3f70d8fb416b66b630d95289ffdda012539ba98ad8b8e0282a24762a51c47": {
+    "content": "{\"tasks\": [{\"task_id\": \"T1\", \"description\": \"Add basic in-process redirect caching (default 200ms target).\", \"depends_on\": [], \"file_scope\": [\"app/service.py\"], \"effort\": \"M\", \"risk\": \"low\"}, {\"task_id\": \"T2\", \"description\": \"Add daily click-count aggregation.\", \"depends_on\": [], \"file_scope\": [\"app/service.py\"], \"effort\": \"S\", \"risk\": \"low\"}]}",
+    "latency_ms": 0,
+    "model": "claude-sonnet-5",
+    "parsed": null,
+    "request_hash": "dde3f70d8fb416b66b630d95289ffdda012539ba98ad8b8e0282a24762a51c47",
+    "tokens": {
+      "completion_tokens": 0,
+      "cost_usd": 0.0,
+      "prompt_tokens": 0,
+      "total_tokens": 0
+    }
+  }
+}

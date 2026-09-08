@@ -1,0 +1,192 @@
+"""Records cassettes/brownfield.json for the brownfield scenario
+(Section 11.2), the same way scripts/record_greenfield_cassette.py does
+for greenfield — see that file's docstring for why a NodeKeyedProvider
+stands in for a live recording in this network-less sandbox.
+
+Runs against a throwaway COPY of the real, greenfield-produced
+workspace (never the permanent workspace/urlshortener/ itself), so
+recording never mutates the actual baseline.
+
+Usage: python scripts/record_brownfield_cassette.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+from pathlib import Path
+
+from agentic.core.context import ContextStore
+from agentic.core.engine import Engine
+from agentic.core.events import EventLog
+from agentic.core.store import RunStore
+from agentic.llm.cassette import Cassette, CassetteEntry
+from agentic.llm.provider import LLMProvider, LLMRequest, LLMResponse
+from agentic.workflows import brownfield
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROMPTS_DIR = REPO_ROOT / "src" / "agentic" / "llm" / "prompts"
+CASSETTE_PATH = REPO_ROOT / "cassettes" / "brownfield.json"
+REAL_WORKSPACE = REPO_ROOT / "workspace" / "urlshortener"
+RECORDING_DIR = REPO_ROOT / ".recording_tmp_brownfield"
+
+
+def _read(rel: str) -> str:
+    return (REAL_WORKSPACE / rel).read_text(encoding="utf-8")
+
+
+def _canned_responses() -> dict[str, dict]:
+    return {
+        "req.analyze": {
+            "normalized_spec": (
+                "Add a bulk link-creation endpoint (POST /api/v1/links/bulk) to the existing "
+                "URL shortener. Each item in the batch is validated and created independently, "
+                "so one invalid entry does not fail the whole request; the response is a "
+                "per-item ok/error result list in request order."
+            ),
+            "acceptance_criteria": [
+                {"id": "AC-B1", "statement": "POST /api/v1/links/bulk accepts a list of link items and creates each independently.", "testable": True},
+                {"id": "AC-B2", "statement": "A single invalid item (bad target_url or reserved alias) does not prevent other items from succeeding.", "testable": True},
+                {"id": "AC-B3", "statement": "The response is a list matching request order, each with ok/code/target_url/error.", "testable": True},
+            ],
+            "ambiguity_register": [
+                {"id": "AMB-B1", "description": "No maximum batch size specified.", "assumption_if_unresolved": "Cap at 100 items per request."},
+            ],
+        },
+        "req.ambiguity": {
+            "scored": [
+                {"id": "AMB-B1", "question": "What is the maximum bulk batch size?", "proposed_default": "100 items.", "impact": 0.3, "uncertainty": 0.3},
+            ],
+            "above_threshold_ids": [],
+            "assumptions": ["Bulk requests are capped at 100 items."],
+        },
+        "plan.decompose": {
+            "tasks": [
+                {
+                    "task_id": "T1", "description": "Add LinkService.create_links_bulk and the POST /api/v1/links/bulk router.",
+                    "depends_on": [], "file_scope": ["app/service.py", "app/main.py"], "effort": "M", "risk": "low",
+                },
+            ],
+        },
+        "analysis.impact": {
+            "impacted_modules": [
+                {"path": "app/service.py", "reason": "needs a new create_links_bulk method"},
+                {"path": "app/main.py", "reason": "needs a new POST /api/v1/links/bulk route"},
+            ],
+            "impacted_endpoints": ["POST /api/v1/links"],
+            "migration_required": False,
+            "blast_radius_files": 2,
+        },
+        "design.api": {
+            "openapi_version": "3.1.0",
+            "endpoints": [
+                {"method": "POST", "path": "/api/v1/links/bulk", "summary": "Create multiple links in one request; each item is validated independently.", "request_schema": {}, "response_schema": {}},
+            ],
+            "examples": {},
+        },
+        "impl.T1": {
+            "files": [
+                {"path": "app/service.py", "content": _read("app/service.py")},
+                {"path": "app/main.py", "content": _read("app/main.py")},
+            ],
+            "summary": "Added LinkService.create_links_bulk and the POST /api/v1/links/bulk endpoint.",
+        },
+        "verify.security": {
+            "findings": [],
+        },
+        "verify.unit": {
+            "test_files": [
+                {"path": "tests/test_service.py", "content": _read("tests/test_service.py")},
+                {"path": "tests/test_api.py", "content": _read("tests/test_api.py")},
+            ],
+            "summary": "Extended the test suite with bulk-creation unit and integration tests.",
+        },
+        "docs.generate": {
+            "documents": [
+                {"path": "README.md", "content": (
+                    "# URL Shortener\n\n"
+                    "Generated by the Agentic SDLC Orchestrator.\n\n"
+                    "## Endpoints\n\n"
+                    "- `POST /api/v1/links` - create a short link\n"
+                    "- `POST /api/v1/links/bulk` - create up to 100 links in one request; each item is validated independently\n"
+                    "- `GET /{code}` - redirect\n"
+                    "- `GET /api/v1/links/{code}` - link metadata\n"
+                    "- `DELETE /api/v1/links/{code}` - soft-delete\n"
+                    "- `GET /healthz`, `GET /readyz` - health probes\n\n"
+                    "## Changelog\n\n"
+                    "- Added bulk link creation (brownfield change).\n\n"
+                    "## Known limitations\n\n"
+                    "- Persistence is in-memory.\n"
+                    "- No rate limiting or redirect caching in this pass.\n"
+                )},
+            ],
+        },
+        "release.readiness": {
+            "go_no_go": "go",
+            "summary": "Bulk endpoint added; all exit gates passed at >=80% coverage, no HIGH/CRITICAL findings.",
+            "risks": ["Bulk requests are unbounded in cost if the cap is raised later without a rate limit."],
+            "limitations": ["No SQLAlchemy/SQLite persistence.", "No rate limiting.", "Bulk cap fixed at 100 items."],
+        },
+    }
+
+
+class NodeKeyedProvider(LLMProvider):
+    def __init__(self, responses: dict[str, dict], cassette: Cassette) -> None:
+        self.responses = responses
+        self.cassette = cassette
+
+    async def complete(self, req: LLMRequest) -> LLMResponse:
+        if req.node_id not in self.responses:
+            raise KeyError(f"no canned response for node_id {req.node_id!r}")
+        content = json.dumps(self.responses[req.node_id])
+        self.cassette.put(CassetteEntry(request_hash=req.request_hash, content=content, model=req.model))
+        return LLMResponse(content=content, model=req.model, from_cassette=False)
+
+
+async def _record() -> None:
+    if RECORDING_DIR.exists():
+        shutil.rmtree(RECORDING_DIR, ignore_errors=True)
+    RECORDING_DIR.mkdir(parents=True)
+    recording_workspace = RECORDING_DIR / "workspace"
+    shutil.copytree(REAL_WORKSPACE, recording_workspace, ignore=shutil.ignore_patterns(
+        "__pycache__", "*.pyc", ".pytest_cache", ".coverage", ".mypy_cache", ".ruff_cache",
+    ))
+
+    graph = brownfield.build_graph()
+    context = ContextStore(graph, persist_dir=RECORDING_DIR / "artifacts")
+    events = EventLog(path=RECORDING_DIR / "events.jsonl", run_id="record")
+    store = RunStore(RECORDING_DIR / "state.db")
+
+    cassette = Cassette(CASSETTE_PATH)
+    provider = NodeKeyedProvider(_canned_responses(), cassette)
+
+    node_executors, executors_by_agent = brownfield.build_node_executors(
+        provider, PROMPTS_DIR, recording_workspace, run_id="record"
+    )
+    engine = Engine(
+        run_id="record", graph=graph, context=context, event_log=events, store=store,
+        node_executors=node_executors, executors_by_agent=executors_by_agent,
+        graph_expanders={"plan.decompose": brownfield.expand_impl_tasks},
+    )
+    engine.start(scenario="brownfield", workflow="brownfield")
+
+    state = await engine.run()
+    while state.status.value == "AWAITING_APPROVAL":
+        for node_id, node_run in state.nodes.items():
+            if node_run.status.value == "AWAITING_APPROVAL":
+                engine.grant_approval(node_id, note="recorded by recording-script")
+        state = await engine.run()
+
+    if state.status.value != "SUCCEEDED":
+        for node_id, node_run in state.nodes.items():
+            if node_run.error:
+                print(f"  {node_id}: {node_run.error}")
+        raise RuntimeError(f"recording run did not succeed: {state.status.value}")
+
+    print(f"Recorded {len(cassette)} interactions to {CASSETTE_PATH}")
+    shutil.rmtree(RECORDING_DIR, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(_record())

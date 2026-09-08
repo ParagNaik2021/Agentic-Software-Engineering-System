@@ -1,4 +1,4 @@
-.PHONY: install test lint format demo demo-greenfield demo-brownfield demo-ambiguous demo-faults demo-all clean
+.PHONY: install test lint format demo demo-greenfield demo-brownfield demo-ambiguous demo-all clean
 
 install:
 	pip install -e ".[dev,target]"
@@ -25,10 +25,7 @@ demo-brownfield:
 demo-ambiguous:
 	agentic run ambiguous --mode replay
 
-demo-faults:
-	agentic run brownfield --mode replay --inject-fault "node=verify.unit,kind=quality,persist=true"
-
-demo-all: demo-greenfield demo-brownfield demo-ambiguous demo-faults
+demo-all: demo-greenfield demo-brownfield demo-ambiguous
 
 clean:
 	rm -rf .pytest_cache .ruff_cache .mypy_cache htmlcov .coverage

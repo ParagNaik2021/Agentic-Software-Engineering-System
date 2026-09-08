@@ -28,9 +28,11 @@ class PlannerAgent(Agent):
     def _build_user_message(self, ctx: ContextView, **context: object) -> str:
         spec = ctx.get("normalized_spec")
         clarifications = ctx.get("clarification_questions")
+        answer = ctx.get("clarification_answer")
         return json.dumps({
             "normalized_spec": spec.payload if spec else {},
             "clarifications": clarifications.payload if clarifications else {},
+            "clarification_answer": answer.payload if answer else None,
         })
 
     def _to_artifacts_and_decisions(
