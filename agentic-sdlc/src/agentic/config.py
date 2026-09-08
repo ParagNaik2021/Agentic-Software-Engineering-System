@@ -11,7 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -65,6 +65,20 @@ class Settings(BaseSettings):
     retry_max_attempts: int = 3
     retry_base_seconds: float = 2.0
     retry_cap_seconds: float = 30.0
+
+    @model_validator(mode="after")
+    def _anchor_relative_paths_to_repo_root(self) -> Settings:
+        """Path fields default to bare relative names (Path("runs"),
+        Path("cassettes"), ...) so an override can still be a simple
+        relative string. Left unanchored, they resolve against the
+        process's current working directory instead of the repo, so
+        `agentic` breaks the moment it's invoked from anywhere other
+        than the repo root (e.g. from workspace/urlshortener/)."""
+        for field_name in ("runs_dir", "cassettes_dir", "workspace_dir", "policies_dir", "prompts_dir"):
+            value: Path = getattr(self, field_name)
+            if not value.is_absolute():
+                setattr(self, field_name, self.repo_root / value)
+        return self
 
     def run_dir(self, run_id: str) -> Path:
         return self.runs_dir / run_id

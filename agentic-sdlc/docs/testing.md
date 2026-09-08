@@ -100,6 +100,23 @@ and are the reason `tests/integration/test_engine_resume.py` now explicitly
 diffs a resumed run's context and decisions against a continuous one,
 rather than only checking final `RunState.status`.
 
+- **The CLI broke when invoked from any directory other than the repo
+  root** — `Settings.runs_dir` / `cassettes_dir` / `workspace_dir` /
+  `prompts_dir` / `policies_dir` all defaulted to bare relative `Path`s
+  (`Path("cassettes")`, etc.) that were never anchored to the already-
+  correctly-computed `Settings.repo_root`. Every test invokes `agentic`
+  (or constructs `Settings` directly) from the repo root, so nothing
+  caught this — it surfaced only when `agentic run brownfield --mode
+  replay` was run from inside `workspace/`: `cassettes_dir` resolved to
+  `workspace/cassettes` (doesn't exist), `req.analyze` failed on the
+  resulting replay-miss, and the run safe-stopped (`HALTED`) exactly as
+  the classifier is supposed to on a systemic condition — the classifier
+  wasn't wrong, the path resolution was. Fixed with a
+  `model_validator(mode="after")` in `config.py` that anchors any
+  non-absolute path field to `repo_root`. No automated test exercises
+  `agentic` from a non-root cwd yet; that's a gap worth closing rather
+  than trusting this doesn't regress.
+
 **Takeaway carried forward**: an in-process fixture that constructs the
 object under test directly is not a substitute for actually crossing the
 boundary a real user crosses (a new OS process, a fresh CLI invocation). For
