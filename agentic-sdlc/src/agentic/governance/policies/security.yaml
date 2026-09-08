@@ -1,0 +1,45 @@
+# Security policy catalogue (Section 6.1). Logic lives in
+# governance/rules.py; this file documents the same rules as data so an
+# auditor can read what governs the system without reading code.
+rules:
+  - id: SEC-001
+    category: security
+    hook: after_agent_output
+    rule: "No hardcoded secrets, API keys or credentials in generated code (regex + entropy check)."
+    verdict_on_violation: DENY
+
+  - id: SEC-002
+    category: security
+    hook: after_agent_output
+    rule: "No dangerous constructs: eval, exec, pickle.loads, subprocess with shell=True, os.system."
+    verdict_on_violation: DENY
+
+  - id: SEC-003
+    category: security
+    hook: after_agent_output
+    rule: "Generated HTTP handlers accepting URLs must validate scheme and block private/loopback ranges (SSRF)."
+    verdict_on_violation: DENY
+
+  - id: SEC-004
+    category: security
+    hook: before_tool_invocation
+    rule: "All file writes confined to the workspace jail; path traversal attempts blocked."
+    verdict_on_violation: DENY
+
+  - id: SEC-005
+    category: security
+    hook: before_tool_invocation
+    rule: "Shell execution restricted to an allowlist (pytest, ruff, mypy, bandit, git, python)."
+    verdict_on_violation: DENY
+
+  - id: SEC-006
+    category: security
+    hook: after_agent_output
+    rule: "Bandit HIGH severity findings block the quality gate."
+    verdict_on_violation: DENY
+
+  - id: SEC-007
+    category: security
+    hook: after_agent_output
+    rule: "Agent output scanned for prompt-injection markers before being treated as instructions."
+    verdict_on_violation: WARN

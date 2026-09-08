@@ -1,0 +1,32 @@
+# Compliance policy catalogue (Section 6.1). Logic lives in
+# governance/rules.py; this file documents the same rules as data.
+rules:
+  - id: CMP-001
+    category: compliance
+    hook: after_agent_output
+    rule: "Every artifact carries provenance: run_id, node, agent, prompt hash, timestamp."
+    verdict_on_violation: DENY
+
+  - id: CMP-002
+    category: compliance
+    hook: after_agent_output
+    rule: "Every design-stage node records at least one Decision with rationale and alternatives."
+    verdict_on_violation: REQUIRE_APPROVAL
+
+  - id: CMP-003
+    category: compliance
+    hook: after_agent_output
+    rule: "No PII patterns (email, SSN-shaped, card-shaped) in generated code, fixtures or logs."
+    verdict_on_violation: DENY
+
+  - id: CMP-004
+    category: compliance
+    hook: before_run_completion
+    rule: "Audit event chain must be unbroken; hash mismatch fails the run."
+    verdict_on_violation: DENY
+
+  - id: CMP-005
+    category: compliance
+    hook: after_agent_output
+    rule: "Generated dependencies restricted to a declared allowlist; new ones need approval."
+    verdict_on_violation: REQUIRE_APPROVAL

@@ -1,0 +1,54 @@
+# Change-control policy catalogue (Section 6.1), plus the two
+# Governance-category rules (GOV-001/GOV-002) — the brief's repo layout
+# names only three policy YAML files, so run-level governance rules are
+# documented here alongside change control rather than in a fourth file.
+# Logic lives in governance/rules.py; this file documents the same
+# rules as data.
+rules:
+  - id: CHG-001
+    category: change_control
+    hook: before_node_entry
+    rule: "Brownfield implementation requires a current impact_report artifact."
+    verdict_on_violation: DENY
+
+  - id: CHG-002
+    category: change_control
+    hook: after_agent_output
+    rule: "Change budget: more than N files touched (default 10) in one node escalates."
+    verdict_on_violation: REQUIRE_APPROVAL
+
+  - id: CHG-003
+    category: change_control
+    hook: after_agent_output
+    rule: "Test coverage must not decrease relative to the pre-change baseline."
+    verdict_on_violation: DENY
+
+  - id: CHG-004
+    category: change_control
+    hook: after_agent_output
+    rule: "Public API contract changes (removed or renamed endpoints/fields) escalate."
+    verdict_on_violation: REQUIRE_APPROVAL
+
+  - id: CHG-005
+    category: change_control
+    hook: after_agent_output
+    rule: "Deletion of existing test files is prohibited."
+    verdict_on_violation: DENY
+
+  - id: CHG-006
+    category: change_control
+    hook: before_tool_invocation
+    rule: "Every workspace mutation must occur inside a git checkpoint window."
+    verdict_on_violation: DENY
+
+  - id: GOV-001
+    category: governance
+    hook: before_node_entry
+    rule: "Design acceptance and release readiness always require human approval."
+    verdict_on_violation: REQUIRE_APPROVAL
+
+  - id: GOV-002
+    category: governance
+    hook: before_node_entry
+    rule: "Run token/cost/wall-clock budget exhaustion engages safe-stop."
+    verdict_on_violation: DENY
