@@ -44,8 +44,15 @@ class RecoveryManager:
         attempt: int,
         retry_policy: RetryPolicy,
         fallback_spec: FallbackSpec | None = None,
+        detail: str = "",
     ) -> RecoveryDecision:
-        """attempt is the attempt number that just failed (1-indexed)."""
+        """attempt is the attempt number that just failed (1-indexed).
+
+        `detail` is the concrete cause, supplied by the caller (the
+        Engine passes the failed node's error message). It exists so a
+        SYSTEMIC safe-stop can say what actually happened instead of
+        listing every condition that might have.
+        """
         if error_class == ErrorClass.TRANSIENT:
             return self._decide_transient(attempt, retry_policy)
         if error_class == ErrorClass.MALFORMED_OUTPUT:
@@ -60,9 +67,15 @@ class RecoveryManager:
         if error_class == ErrorClass.CONTRACT_BREACH:
             return self._decide_contract_breach(fallback_spec)
         if error_class == ErrorClass.SYSTEMIC:
+            # Deliberately no retry: a SYSTEMIC classification means the
+            # failure's retry-safety is unknown (engine._classify_exception),
+            # so re-running the node could repeat a harmful side effect.
+            # The reason names the actual cause rather than enumerating
+            # budget/audit-chain/deadlock/replan-exhaustion, each of which
+            # safe-stops from its own call site with its own reason.
             return RecoveryDecision(
                 strategy="safe_stop", error_class=error_class,
-                reason="systemic failure (budget exhausted, audit chain broken, deadlock, or replan budget exceeded)",
+                reason=f"systemic failure: {detail}" if detail else "systemic failure: unclassified error",
             )
         raise ValueError(f"unknown error class: {error_class}")
 

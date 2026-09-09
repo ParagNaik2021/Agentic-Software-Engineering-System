@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>URL Shortener</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.05rem; margin-top: 2.2rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
+  section { margin-bottom: 1.5rem; }
+  label { display: block; font-size: .85rem; margin: .5rem 0 .2rem; opacity: .8; }
+  input[type=text], input[type=url] { width: 100%; box-sizing: border-box; padding: .4rem .5rem; font-size: .95rem; }
+  button { padding: .4rem .9rem; margin-top: .6rem; cursor: pointer; }
+  .row { display: flex; gap: .6rem; align-items: flex-end; }
+  .row > div { flex: 1; }
+  table { border-collapse: collapse; width: 100%; margin-top: .6rem; font-size: .85rem; }
+  th, td { border: 1px solid #8884; padding: .3rem .5rem; text-align: left; word-break: break-all; }
+  th { background: #8881; }
+  .ok { color: #1a7f37; }
+  .err { color: #c0392b; }
+  .muted { opacity: .65; font-size: .85rem; }
+  .result-box { margin-top: .6rem; padding: .6rem .8rem; border: 1px solid #8884; border-radius: 6px; font-size: .9rem; display: none; }
+  .bulk-item { display: flex; gap: .5rem; margin-bottom: .4rem; }
+  .bulk-item input { flex: 1; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>URL Shortener</h1>
+<p class="muted">Talks to this app's own API at its own origin (no separate server, no CORS config needed).</p>
+
+<section>
+  <h2>Create a short link</h2>
+  <div class="row">
+    <div>
+      <label for="create-url">Target URL</label>
+      <input type="url" id="create-url" placeholder="https://example.com/some/long/path">
+    </div>
+    <div id="alias-field" hidden>
+      <label for="create-alias">Custom alias (optional)</label>
+      <input type="text" id="create-alias" placeholder="my-alias">
+    </div>
+  </div>
+  <button id="create-btn">Create short link</button>
+  <div id="create-result" class="result-box"></div>
+</section>
+
+<section>
+  <h2>Test a redirect</h2>
+  <div class="row">
+    <div>
+      <label for="redirect-code">Short code</label>
+      <input type="text" id="redirect-code" placeholder="abc123">
+    </div>
+  </div>
+  <button id="check-btn">Check</button>
+  <button id="open-btn">Open redirect ↗</button>
+  <div id="redirect-result" class="result-box"></div>
+</section>
+
+<section id="bulk-section" hidden>
+  <h2>Bulk create</h2>
+  <div id="bulk-rows"></div>
+  <button id="bulk-add-btn">+ Add row</button>
+  <button id="bulk-submit-btn">Bulk create</button>
+  <table id="bulk-table" hidden>
+    <thead><tr><th>OK</th><th>Code</th><th>Target URL</th><th>Short Link</th><th>Error</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Session history</h2>
+  <table>
+    <thead><tr><th>Time</th><th>Action</th><th>Detail</th></tr></thead>
+    <tbody id="history-body"></tbody>
+  </table>
+</section>
+
+<script>
+const historyBody = document.getElementById("history-body");
+
+function logHistory(action, detail) {
+  const tr = document.createElement("tr");
+  const time = new Date().toLocaleTimeString();
+  tr.innerHTML = `<td>${time}</td><td>${action}</td><td>${detail}</td>`;
+  historyBody.prepend(tr);
+}
+
+function showResult(el, ok, html) {
+  el.style.display = "block";
+  el.className = "result-box " + (ok ? "ok" : "err");
+  el.innerHTML = html;
+}
+
+// --- create ---
+document.getElementById("create-btn").addEventListener("click", async () => {
+  const targetUrl = document.getElementById("create-url").value.trim();
+  const resultEl = document.getElementById("create-result");
+  if (!targetUrl) { showResult(resultEl, false, "Enter a target URL first."); return; }
+
+  const body = { target_url: targetUrl };
+  if (!document.getElementById("alias-field").hidden) {
+    const alias = document.getElementById("create-alias").value.trim();
+    if (alias) body.custom_alias = alias;
+  }
+
+  try {
+    const resp = await fetch("/api/v1/links", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      const shortUrl = `${location.origin}/${data.code}`;
+      showResult(resultEl, true, `Short link: <a href="${shortUrl}" target="_blank">${shortUrl}</a> &rarr; ${data.target_url}`);
+      logHistory("create", `${data.code} &rarr; ${data.target_url}`);
+      document.getElementById("redirect-code").value = data.code;
+    } else {
+      const msg = data.error ? data.error.message : JSON.stringify(data);
+      showResult(resultEl, false, `Failed: ${msg}`);
+      logHistory("create (failed)", msg);
+    }
+  } catch (err) {
+    showResult(resultEl, false, `Request failed: ${err}`);
+  }
+});
+
+// --- redirect check ---
+document.getElementById("check-btn").addEventListener("click", async () => {
+  const code = document.getElementById("redirect-code").value.trim();
+  const resultEl = document.getElementById("redirect-result");
+  if (!code) { showResult(resultEl, false, "Enter a short code first."); return; }
+
+  try {
+    const resp = await fetch(`/api/v1/links/${encodeURIComponent(code)}`);
+    const data = await resp.json();
+    if (resp.ok) {
+      showResult(
+        resultEl, true,
+        `Active: ${data.is_active} &middot; Target: ${data.target_url} &middot; Clicks: ${data.click_count}`
+      );
+      logHistory("check", `${code}: ${data.target_url}`);
+    } else {
+      showResult(resultEl, false, `Not found: ${code}`);
+      logHistory("check (not found)", code);
+    }
+  } catch (err) {
+    showResult(resultEl, false, `Request failed: ${err}`);
+  }
+});
+
+document.getElementById("open-btn").addEventListener("click", () => {
+  const code = document.getElementById("redirect-code").value.trim();
+  if (!code) return;
+  logHistory("open redirect", code);
+  window.open(`/${code}`, "_blank");
+});
+
+// --- bulk create (only rendered when this build's schema declares it) ---
+const bulkRows = document.getElementById("bulk-rows");
+
+function addBulkRow() {
+  const row = document.createElement("div");
+  row.className = "bulk-item";
+  row.innerHTML = `<input type="url" class="bulk-url" placeholder="https://example.com/...">
+                    <input type="text" class="bulk-alias" placeholder="alias (optional)" style="max-width:140px">`;
+  bulkRows.appendChild(row);
+}
+
+document.getElementById("bulk-add-btn").addEventListener("click", () => addBulkRow());
+
+document.getElementById("bulk-submit-btn").addEventListener("click", async () => {
+  const urls = [...document.querySelectorAll(".bulk-url")];
+  const aliases = [...document.querySelectorAll(".bulk-alias")];
+  const items = urls
+    .map((input, i) => ({ target_url: input.value.trim(), alias: aliases[i].value.trim() }))
+    .filter((item) => item.target_url)
+    .map((item) => (item.alias ? { target_url: item.target_url, custom_alias: item.alias } : { target_url: item.target_url }));
+
+  if (items.length === 0) return;
+
+  try {
+    const resp = await fetch("/api/v1/links/bulk", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }),
+    });
+    const results = await resp.json();
+    const table = document.getElementById("bulk-table");
+    const tbody = table.querySelector("tbody");
+    tbody.innerHTML = "";
+    for (const r of results) {
+      const tr = document.createElement("tr");
+      const shortLinkCell = r.ok
+        ? `<a href="${window.location.origin}/${r.code}" target="_blank">${window.location.origin}/${r.code}</a>`
+        : "—";
+      tr.innerHTML = `<td class="${r.ok ? "ok" : "err"}">${r.ok}</td><td>${r.code ?? ""}</td><td>${r.target_url ?? ""}</td><td>${shortLinkCell}</td><td>${r.error ?? ""}</td>`;
+      tbody.appendChild(tr);
+    }
+    table.hidden = false;
+    const okCount = results.filter((r) => r.ok).length;
+    logHistory("bulk create", `${okCount}/${results.length} succeeded`);
+  } catch (err) {
+    logHistory("bulk create (failed)", String(err));
+  }
+});
+
+// --- feature-detect brownfield-or-later from this build's own OpenAPI schema:
+// /api/v1/links/bulk existing is the one reliable signal (not "if brownfield")
+// that both the alias field and the bulk section should render. ---
+(async () => {
+  try {
+    const resp = await fetch("/openapi.json");
+    const schema = await resp.json();
+    if (schema.paths && schema.paths["/api/v1/links/bulk"]) {
+      document.getElementById("alias-field").hidden = false;
+      document.getElementById("bulk-section").hidden = false;
+      addBulkRow();
+      addBulkRow();
+    }
+  } catch (err) {
+    // introspection failed: leave both hidden rather than guess
+  }
+})();
+</script>
+</body>
+</html>

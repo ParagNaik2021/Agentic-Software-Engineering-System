@@ -69,8 +69,12 @@ def _executors_for(
         )
         return node_executors, executors_by_agent, {"plan.decompose": brownfield.expand_impl_tasks}
     if workflow == "ambiguous":
-        node_executors = ambiguous.build_node_executors(provider, pdir, run_id, clarification_answer)
-        return node_executors, {}, {}
+        node_executors, executors_by_agent = ambiguous.build_node_executors(
+            provider, pdir, workspace_root(settings), run_id, clarification_answer
+        )
+        # same expander as greenfield: ambiguous now runs the same
+        # implementation fan-out, so impl.<task_id> must be expanded too
+        return node_executors, executors_by_agent, {"plan.decompose": ambiguous.expand_impl_tasks}
     raise ValueError(f"unknown workflow: {workflow!r}")
 
 
@@ -112,6 +116,41 @@ def _read_workflow_name(rdir: Path, run_id: str) -> str:
         if event.type == EventType.RUN_STARTED:
             return str(event.payload["workflow"])
     raise UnknownRun(f"run {run_id!r} has no RUN_STARTED event")
+
+
+def approve_and_save(engine: Engine, node_id: str, note: str = "") -> None:
+    """The exact step `agentic approve` performs — factored out so
+    `agentic watch`'s GUI can call the identical logic in-process instead
+    of shelling back out to the CLI."""
+    assert engine.state is not None
+    engine.grant_approval(node_id, note=note)
+    engine.store.save(engine.state)
+
+
+def reject_and_save(engine: Engine, node_id: str, note: str = "") -> None:
+    """The exact step `agentic reject` performs — see approve_and_save."""
+    assert engine.state is not None
+    engine.reject_approval(node_id, note=note)
+    engine.store.save(engine.state)
+
+
+def submit_clarification_and_save(engine: Engine, node_id: str, answer: str) -> None:
+    """The GUI counterpart of `--clarification-answer`: bind the
+    clarification node's executor to the answer a human just typed, then
+    release the checkpoint exactly as approve_and_save does.
+
+    This deliberately reuses `ambiguous.clarify_executor` — the same
+    factory the flag path ends at (cli.run -> new_engine ->
+    _executors_for -> ambiguous.build_node_executors ->
+    clarify_executor), so the artifact the node produces, and therefore
+    the input_hash change that drives re-planning, is produced by one
+    code path regardless of where the answer was typed. The flag is
+    untouched by this: its value is simply what stays installed when
+    nobody submits an answer through the GUI.
+    """
+    assert engine.state is not None
+    engine.node_executors[node_id] = ambiguous.clarify_executor(engine.run_id, answer)
+    approve_and_save(engine, node_id, note=f"clarification answered via GUI: {answer}")
 
 
 def load_engine(

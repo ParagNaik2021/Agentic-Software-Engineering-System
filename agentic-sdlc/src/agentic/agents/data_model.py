@@ -28,10 +28,18 @@ class DataModelAgent(Agent):
     def _build_user_message(self, ctx: ContextView, **context: object) -> str:
         spec = ctx.get("normalized_spec")
         impact = ctx.get("impact_report")
-        return json.dumps({
+        message: dict[str, object] = {
             "normalized_spec": spec.payload if spec else {},
             "impact_report": impact.payload if impact else {},
-        })
+        }
+        # See architect.py's identical handling: present only after a
+        # human's `--from-rejection` recovery, omitted (not null) otherwise
+        # so a pre-existing cassette recorded before this field existed
+        # still replay-hits.
+        feedback = ctx.get("design.review_rejection_feedback")
+        if feedback is not None:
+            message["rejection_feedback"] = feedback.payload
+        return json.dumps(message)
 
     def _to_artifacts_and_decisions(
         self, parsed: BaseModel, ctx: ContextView, **context: object

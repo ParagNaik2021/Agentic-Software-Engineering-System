@@ -29,11 +29,22 @@ class ArchitectAgent(Agent):
         spec = ctx.get("normalized_spec")
         tasks = ctx.get("task_graph")
         impact = ctx.get("impact_report")
-        return json.dumps({
+        message: dict[str, object] = {
             "normalized_spec": spec.payload if spec else {},
             "task_graph": tasks.payload if tasks else {},
             "impact_report": impact.payload if impact else {},
-        })
+        }
+        # Present only when a human ran `agentic replan --node design.review
+        # --from-rejection` (core/engine.py's replan_from_rejection) — the
+        # rejection note that sent this node back for rework. Omitted
+        # entirely (not included as null) when absent, so the very first,
+        # never-rejected run's prompt — and its request_hash — is
+        # byte-identical to before this field existed; a cassette recorded
+        # pre-rejection-feedback must still replay-hit.
+        feedback = ctx.get("design.review_rejection_feedback")
+        if feedback is not None:
+            message["rejection_feedback"] = feedback.payload
+        return json.dumps(message)
 
     def _to_artifacts_and_decisions(
         self, parsed: BaseModel, ctx: ContextView, **context: object

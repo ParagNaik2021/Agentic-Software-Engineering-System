@@ -16,6 +16,15 @@ from agentic.core.models import Artifact, Decision, NodeRun, NodeSpec, PolicyVer
 ApprovalStatus = Literal["PENDING", "GRANTED", "REJECTED", "VOID"]
 
 
+class ApprovalNotPermitted(Exception):
+    """Raised when an approve/reject action cannot be honoured at all —
+    the run has already terminated, the node is not at a checkpoint, or
+    the identical decision already stands. Distinct from ApprovalVoid,
+    which means the checkpoint is still live but its inputs moved.
+    """
+
+
+
 @dataclass
 class DecisionPackage:
     """Everything Section 6.2 says must be presented to the approver."""
@@ -45,6 +54,33 @@ class ApprovalVoid(Exception):
     pass
 
 
+def _consequence_of_rejection(node: NodeSpec) -> str:
+    """What actually happens on rejection is the same for every
+    requires_approval node in this engine: reject_approval() transitions
+    straight to REJECTED (core/engine.py), which is not a candidate
+    status the scheduler ever revisits and has no rollback_handler wired
+    for it, so the next tick finds nothing ready and safe-stops on
+    deadlock. There is no automatic rollback here — that path only
+    exists for a node FAILED during execution, not one rejected before
+    it ever ran. What differs by node type is what a human's
+    `--from-rejection` recovery actually re-opens."""
+    recover_cmd = f"agentic replan <run_id> --node {node.node_id} --from-rejection"
+    if node.agent is None:
+        return (
+            "this is a control checkpoint with no agent of its own — rejecting it halts the run "
+            f"via safe-stop (deadlock), not a rollback. Recovery requires an operator to run "
+            f"`{recover_cmd}`, which re-opens {', '.join(node.depends_on) or 'its upstream'} with "
+            "the rejection note attached so they re-run informed by it, then re-evaluates this "
+            "checkpoint once they finish"
+        )
+    return (
+        f"rejecting this halts the run via safe-stop (deadlock) — the '{node.agent}' agent's own "
+        "output is not rolled back automatically. Recovery requires an operator to run "
+        f"`{recover_cmd}`, which re-opens {', '.join(node.depends_on) or 'its upstream'} with the "
+        f"rejection note attached and re-runs '{node.agent}' to produce a fresh recommendation"
+    )
+
+
 class ApprovalManager:
     def __init__(self) -> None:
         self._records: dict[str, ApprovalRecord] = {}
@@ -72,18 +108,27 @@ class ApprovalManager:
         decisions = [
             d for did in node_run.decisions if (d := context.get_decision(did)) is not None
         ]
+        # view_for() is strictly upstream-of-node_id, which is correct for
+        # a *pending* approval (the node hasn't run, so it has produced
+        # nothing yet to show). But render_package is also used
+        # retrospectively (`agentic approvals show` after a run has
+        # completed), and for a node with agent="release_manager" (or
+        # any other agent-bearing gate) the whole point of looking is its
+        # own output — the go/no-go recommendation, not its inputs.
+        # node_run.produced already exists for exactly this case: it's
+        # only non-empty once the node has actually executed.
+        own_artifacts = [
+            a for aid in node_run.produced if (a := context.get_by_id(aid)) is not None
+        ]
         return DecisionPackage(
             node_id=node.node_id,
             stage=node.stage.value,
             input_hash=context.input_hash(node.node_id),
-            artifacts=list(view.artifacts.values()),
+            artifacts=[*view.artifacts.values(), *own_artifacts],
             decisions=decisions,
             policy_verdicts=policy_verdicts or [],
             blast_radius=blast_radius or {"files": [], "endpoints": []},
-            consequence_of_rejection=(
-                "the node is routed to rollback; any workspace changes since the last "
-                "checkpoint are reverted and the run awaits revised guidance"
-            ),
+            consequence_of_rejection=_consequence_of_rejection(node),
         )
 
     def grant(self, node_id: str, current_input_hash: str, approver: str, note: str = "") -> ApprovalRecord:

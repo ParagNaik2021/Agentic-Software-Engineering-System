@@ -32,6 +32,8 @@ import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from uuid import uuid4
 
 from agentic.core.context import ContextStore, ContextView
 from agentic.core.events import Actor, EventLog, EventType
@@ -48,12 +50,19 @@ from agentic.core.models import (
     RunMetrics,
     RunState,
     RunStatus,
+    compute_content_hash,
 )
-from agentic.core.replan import ReplanBudgetExceeded, ReplanController
+from agentic.core.replan import (
+    ReplanBudgetExceeded,
+    ReplanController,
+    compute_invalidation_set,
+)
 from agentic.core.states import NodeStatus, assert_transition
 from agentic.core.store import RunStore
+from agentic.governance.approvals import ApprovalNotPermitted
 from agentic.governance.recovery import RecoveryManager
 from agentic.llm.provider import MalformedOutputError, QualityFaultError, TransientProviderError
+from agentic.llm.replay import ReplayMiss
 
 SYSTEM = Actor(kind="system", id="engine")
 APPROVER = Actor(kind="human", id="approver")
@@ -72,6 +81,13 @@ def _classify_exception(exc: BaseException) -> ErrorClass:
         return ErrorClass.MALFORMED_OUTPUT
     if isinstance(exc, QualityFaultError):
         return ErrorClass.QUALITY_FAILURE
+    if isinstance(exc, ReplayMiss):
+        # A cassette miss is deterministic: the same prompt will miss
+        # again, so retrying is pointless and fabricating a response is
+        # not an option. It is SYSTEMIC (safe-stop), but classified
+        # explicitly so the safe-stop reason says 'replay cassette miss'
+        # rather than 'unclassified error'.
+        return ErrorClass.SYSTEMIC
     return ErrorClass.SYSTEMIC
 
 _CANDIDATE_STATUSES = (
@@ -356,8 +372,43 @@ class Engine:
         )
         self._state.status = RunStatus.AWAITING_APPROVAL
 
+    _TERMINAL_RUN_STATUSES = (RunStatus.HALTED, RunStatus.FAILED, RunStatus.SUCCEEDED)
+
+    def _assert_decision_allowed(self, node_id: str, action: str) -> None:
+        """Guard for grant_approval/reject_approval.
+
+        A human decision is only meaningful while the checkpoint is live.
+        Without this check the engine recorded APPROVAL_GRANTED for
+        anything at any time — including four duplicate grants on a run
+        that had already SAFE_STOP_ENGAGED, which is an audit-trail defect:
+        the log implied a human released a gate on a halted run.
+        """
+        assert self._state is not None
+        if self._state.status in self._TERMINAL_RUN_STATUSES:
+            raise ApprovalNotPermitted(
+                f"cannot {action} '{node_id}': run {self.run_id} is {self._state.status.value}. "
+                f"Recover it first (agentic replan ... --from-rejection, or start a new run)."
+            )
+        node_run = self._state.nodes.get(node_id)
+        if node_run is None:
+            raise ApprovalNotPermitted(f"cannot {action}: no node '{node_id}' in this run")
+        if node_run.status != NodeStatus.AWAITING_APPROVAL:
+            raise ApprovalNotPermitted(
+                f"cannot {action} '{node_id}': node is {node_run.status.value}, "
+                f"not AWAITING_APPROVAL"
+            )
+
     def grant_approval(self, node_id: str, note: str = "") -> None:
+        self._assert_decision_allowed(node_id, "approve")
         current_hash = self.context.input_hash(node_id)
+        if self.granted_approvals.get(node_id) == current_hash:
+            # idempotence guard: a second click (or a second CLI call)
+            # must not append another APPROVAL_GRANTED for a decision
+            # that already stands against these exact inputs
+            raise ApprovalNotPermitted(
+                f"'{node_id}' is already approved for input_hash {current_hash[:12]}; "
+                f"run `agentic resume {self.run_id}` to continue"
+            )
         self.granted_approvals[node_id] = current_hash
         self.events.append(
             EventType.APPROVAL_GRANTED,
@@ -369,10 +420,91 @@ class Engine:
             self._state.status = RunStatus.RUNNING
 
     def reject_approval(self, node_id: str, note: str = "") -> None:
+        self._assert_decision_allowed(node_id, "reject")
         self.events.append(
             EventType.APPROVAL_REJECTED, APPROVER, node_id=node_id, payload={"note": note}
         )
         self._transition(node_id, NodeStatus.REJECTED)
+
+    def _last_rejection_note(self, node_id: str) -> str:
+        note = ""
+        for event in self.events.read():
+            if event.type == EventType.APPROVAL_REJECTED and event.node_id == node_id:
+                note = str(event.payload.get("note", ""))
+        return note
+
+    async def replan_from_rejection(self, node_id: str) -> None:
+        """`agentic replan <run_id> --node <node> --from-rejection`
+        (Section 6.4's "escalate to a human" path, made actionable):
+        deliberate, human-initiated recovery for a node the operator
+        REJECTED, as opposed to trigger_replan()/replan_now()'s path,
+        which fires when an *upstream artifact's content* changed. The
+        two are kept structurally distinct in the audit trail (different
+        REPLAN_TRIGGERED payload shape, `trigger` field) because they
+        answer different questions later: "why did this get invalidated"
+        -- because a human rejected it and asked for rework, versus
+        because its own inputs drifted out from under it.
+
+        Rejection never triggers this automatically -- reject_approval()
+        only transitions to REJECTED, and the run loop correctly halts on
+        the resulting deadlock (Section 6.4: halting on rejection is the
+        safe default). This method exists to be called deliberately,
+        never from the run loop itself.
+
+        node.depends_on (not the whole upstream closure) is what gets
+        reopened: for design.review that is exactly
+        [design.arch, design.data, design.api]; for release.readiness
+        it is [verify.gate, docs.generate] -- the same mechanism
+        generalizes to any requires_approval node without special-casing
+        which one it is.
+        """
+        node_run = self._state.nodes.get(node_id)
+        if node_run is None or node_run.status != NodeStatus.REJECTED:
+            status = node_run.status.value if node_run else "unknown"
+            raise ValueError(f"'{node_id}' is not REJECTED (status={status}); nothing to recover from")
+
+        note = self._last_rejection_note(node_id)
+        node = self.graph[node_id]
+
+        reopened = [
+            dep_id for dep_id in node.depends_on
+            if (dep_run := self._state.nodes.get(dep_id)) is not None and dep_run.status == NodeStatus.SUCCEEDED
+        ]
+        for dep_id in reopened:
+            self._transition(dep_id, NodeStatus.INVALIDATED)
+            self.events.append(
+                EventType.NODE_INVALIDATED, SYSTEM, node_id=dep_id,
+                payload={"reason": "rejection_feedback", "source_node": node_id},
+            )
+            self._transition(dep_id, NodeStatus.PENDING, extra_payload={"input_hash": None})
+
+        # Visible to any node downstream of `intake` -- i.e. everything --
+        # since view_for() only shows a node artifacts produced by its own
+        # upstream, and the node being reopened is never upstream of
+        # itself. intake is the one node guaranteed upstream of every
+        # reopened node regardless of which approval gate this is.
+        if note:
+            feedback_payload = {"text": note}
+            self.context.put(Artifact(
+                artifact_id=str(uuid4()), name=f"{node_id}_rejection_feedback", kind="spec",
+                content_hash=compute_content_hash(feedback_payload), payload=feedback_payload,
+                produced_by_node="intake", produced_by_agent="human", run_id=self.run_id,
+                created_at=datetime.now(UTC),
+            ))
+
+        await self._perform_rollback(node_id, "human rejection recovery")
+        self._transition(node_id, NodeStatus.PENDING, extra_payload={"input_hash": None})
+
+        self.events.append(
+            EventType.REPLAN_TRIGGERED, SYSTEM,
+            payload={
+                "changed_node": node_id, "invalidated": sorted(reopened),
+                "trigger": "rejection", "note": note,
+            },
+        )
+        self._state.replan_count += 1
+        self._state.metrics.replans += 1
+        self.store.save(self._state)
 
     # ------------------------------------------------------------------
     # execution / settlement
@@ -464,6 +596,7 @@ class Engine:
         else:
             self._transition(node_id, NodeStatus.SUCCEEDED)
             self._expand_graph_if_needed(node_id)
+            self._request_replan_if_staled(node_id)
 
     def _expand_graph_if_needed(self, node_id: str) -> None:
         expander = self.graph_expanders.get(node_id)
@@ -495,7 +628,10 @@ class Engine:
         while self._state.nodes[node_id].status == NodeStatus.FAILED:
             node_run = self._state.nodes[node_id]
             error_class = node_run.error.error_class if node_run.error else ErrorClass.SYSTEMIC
-            decision = self.recovery.decide(error_class, node_run.attempt, node.retry, node.fallback)
+            detail = node_run.error.message if node_run.error else ""
+            decision = self.recovery.decide(
+                error_class, node_run.attempt, node.retry, node.fallback, detail=detail
+            )
 
             if decision.strategy == "retry":
                 self.events.append(
@@ -544,12 +680,43 @@ class Engine:
     # ------------------------------------------------------------------
     # re-planning
     # ------------------------------------------------------------------
+    def _request_replan_if_staled(self, node_id: str) -> None:
+        """A node finishing can invalidate work that already ran on older
+        inputs. The case this exists for is workflows/ambiguous.py's
+        `any`-join: plan.decompose and everything under it run on the
+        ambiguity agent's proposed defaults while req.clarify is still
+        sitting at its human checkpoint, so when req.clarify finally
+        succeeds the design downstream of it is stale by definition.
+
+        Without this hook the ReplanController's queue was only ever
+        filled by `agentic replan` from the CLI, so run()'s
+        `if self.replan.pending()` step never fired on its own and the
+        clarified answer silently never reached the design.
+
+        Detection is the pure compute_invalidation_set; the status flips
+        stay in _apply_replan, so every one of them is still paired with
+        its NODE_INVALIDATED event and the run replays correctly.
+        """
+        assert self._state is not None
+        if compute_invalidation_set(self._state, self.graph, self.context, node_id):
+            self.trigger_replan(node_id)
+
     def _apply_replan(self) -> None:
+        """Triggered by an *upstream artifact's content* changing (Section
+        5.4) -- distinct from replan_from_rejection()'s human-initiated
+        path, which fires on an operator's explicit --from-rejection
+        recovery instead. Both emit REPLAN_TRIGGERED but with a different
+        `trigger` value, so the audit trail never conflates a human
+        rejection-and-rework request with a node's inputs drifting out
+        from under it."""
         changed_node_id, invalidated = self.replan.apply(self._state, self.graph, self.context)
         self.events.append(
             EventType.REPLAN_TRIGGERED,
             SYSTEM,
-            payload={"changed_node": changed_node_id, "invalidated": sorted(invalidated)},
+            payload={
+                "changed_node": changed_node_id, "invalidated": sorted(invalidated),
+                "trigger": "input_hash_mismatch",
+            },
         )
         for node_id in invalidated:
             self._transition(node_id, NodeStatus.INVALIDATED)

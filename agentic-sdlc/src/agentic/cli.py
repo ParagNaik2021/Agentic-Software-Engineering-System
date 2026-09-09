@@ -6,16 +6,21 @@ construction so this module stays argument-parsing and presentation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import webbrowser
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from agentic import runtime
-from agentic.core.models import Artifact, compute_content_hash
-from agentic.governance.approvals import ApprovalManager
+from agentic import runtime, service
+from agentic.core.models import Artifact, RunStatus, compute_content_hash
+from agentic.core.states import NodeStatus
+from agentic.governance.approvals import ApprovalManager, ApprovalNotPermitted
+from agentic.governance.rendering import render_docx, render_text
 from agentic.observability.audit import render_audit_report, verify_run_audit
 from agentic.observability.metrics import MetricsCollector
 from agentic.observability.reporting import (
@@ -60,6 +65,69 @@ def _print_node_statuses(state) -> None:  # noqa: ANN001
         console.print(f"  agentic resume {state.run_id}")
 
 
+# Workflows whose graph actually reaches an implementation stage and so
+# regenerates the app under workspace/urlshortener. `ambiguous` joined
+# these when it was moved onto common.build_canonical_graph(): it runs the
+# same implementation and verification fan-out as greenfield, so the app
+# it serves is one it produced itself.
+_GENERATING_WORKFLOWS = ("greenfield", "brownfield", "ambiguous")
+
+
+def _maybe_autostart_service(state, port: int, no_serve: bool) -> None:  # noqa: ANN001
+    """Post-success convenience step: if this run just reached SUCCEEDED
+    with its summary node SUCCEEDED, and it's a workflow that generates a
+    runnable app, launch that app (with the tester UI mounted) as a
+    detached background process. Entirely separate from orchestration —
+    never touches engine/event-log state, so --mode replay determinism
+    and the existing test suite are unaffected."""
+    if no_serve:
+        return
+    if state.status != RunStatus.SUCCEEDED:
+        return
+    summary_node = state.nodes.get("summary")
+    if summary_node is None or summary_node.status != NodeStatus.SUCCEEDED:
+        return
+
+    settings = runtime.get_settings()
+    workspace_dir = settings.workspace_dir
+    if not service.app_is_built(workspace_dir):
+        # Only reachable for a non-generating workflow with no prior app
+        # on disk; a generating workflow that succeeded has written one.
+        console.print(
+            f"[yellow]nothing to serve: the '{state.workflow}' workflow generates no code and "
+            f"{workspace_dir} holds no app yet — run `agentic run greenfield` first.[/yellow]"
+        )
+        return
+
+    info = service.start_service(workspace_dir, port)
+    if state.workflow not in _GENERATING_WORKFLOWS:
+        console.print(
+            f"[cyan]note:[/cyan] the '{state.workflow}' workflow produces no code — "
+            "serving the app left by the most recent greenfield/brownfield run."
+        )
+
+    if info.note:
+        console.print(f"[yellow]{info.note}[/yellow]")
+    console.print(f"[green]Service started:[/green] http://localhost:{info.port}")
+    console.print(f"[green]Tester UI:[/green]        http://localhost:{info.port}/tester")
+    console.print(f"  pid {info.pid} — to stop: `agentic stop` (or {service.stop_hint(info.pid)})")
+
+    if not info.healthy:
+        console.print(
+            "[red]warning: /healthz did not respond within the startup timeout "
+            "— the service may still be starting or may have failed; check the pid above.[/red]"
+        )
+        return
+
+    opened = False
+    with contextlib.suppress(Exception):
+        opened = webbrowser.open(f"http://localhost:{info.port}/tester")
+    if not opened:
+        console.print(
+            "[yellow]couldn't auto-open a browser here — open the Tester UI link above manually.[/yellow]"
+        )
+
+
 @app.command()
 def run(
     workflow: str = typer.Argument(..., help="Workflow name: greenfield | brownfield | ambiguous"),
@@ -67,6 +135,17 @@ def run(
     clarification_answer: str = typer.Option(
         ambiguous.DEFAULT_CLARIFICATION_ANSWER, "--clarification-answer",
         help="Answer req.clarify will use once approved (ambiguous workflow only).",
+    ),
+    watch: bool = typer.Option(
+        False, "--watch", help="Open the watch GUI immediately instead of running headless."
+    ),
+    port: int = typer.Option(
+        service.DEFAULT_PORT, "--port",
+        help="Port for the auto-started generated app once the run reaches SUCCEEDED.",
+    ),
+    no_serve: bool = typer.Option(
+        False, "--no-serve",
+        help="Skip auto-starting the generated app after a successful run (for CI/automated testing).",
     ),
 ) -> None:
     """Start a new orchestration run for the given workflow.
@@ -87,14 +166,53 @@ def run(
         raise typer.Exit(code=1) from None
 
     engine.start(scenario=workflow, workflow=workflow)
+
+    if watch:
+        from agentic.gui.watch import launch_watch_window
+
+        console.print(f"opened watch GUI for run {run_id}")
+        launch_watch_window(engine)
+        return
+
     state = asyncio.run(engine.run())
     _print_node_statuses(state)
+    _maybe_autostart_service(state, port, no_serve)
+
+
+@app.command()
+def watch(
+    run_id: str = typer.Argument(..., help="Run id to watch."),
+    mode: str = typer.Option("replay", "--mode", help="LLM mode: live | replay"),
+) -> None:
+    """Open a GUI window that advances the run and pops up the right
+    control whenever a node pauses for a human: Approve/Reject for an
+    approval gate, or the ambiguity agent's questions plus an answer box
+    and Submit for a CLARIFICATION-stage node (ambiguous's req.clarify).
+    Replaces manually running `approvals show` / `approve` / `resume`,
+    and for clarification replaces having to pass
+    `--clarification-answer` before the run even starts.
+    """
+    from agentic.gui.watch import run_watch_gui  # tkinter import stays optional until used
+
+    try:
+        run_watch_gui(run_id, mode=mode)
+    except runtime.UnknownRun as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
 
 
 @app.command()
 def resume(
     run_id: str = typer.Argument(..., help="Run id to resume."),
     mode: str = typer.Option("replay", "--mode", help="LLM mode: live | replay"),
+    port: int = typer.Option(
+        service.DEFAULT_PORT, "--port",
+        help="Port for the auto-started generated app if this resume brings the run to SUCCEEDED.",
+    ),
+    no_serve: bool = typer.Option(
+        False, "--no-serve",
+        help="Skip auto-starting the generated app after a successful run (for CI/automated testing).",
+    ),
 ) -> None:
     """Resume a run that is persisted (e.g. paused at an approval checkpoint)."""
     try:
@@ -106,6 +224,19 @@ def resume(
     assert engine.state is not None
     state = asyncio.run(engine.run())
     _print_node_statuses(state)
+    _maybe_autostart_service(state, port, no_serve)
+
+
+@app.command()
+def stop() -> None:
+    """Stop the auto-started app server, so a CLI session doesn't leave
+    an orphaned uvicorn process running after you're done with it."""
+    stopped = service.stop_service(runtime.get_settings().workspace_dir)
+    if stopped is None:
+        console.print("no agentic-started service is running")
+        return
+    pid, port = stopped
+    console.print(f"[yellow]stopped[/yellow] service on http://localhost:{port} (pid {pid})")
 
 
 @app.command()
@@ -121,9 +252,11 @@ def approve(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from None
 
-    assert engine.state is not None
-    engine.grant_approval(node_id, note=note)
-    engine.store.save(engine.state)
+    try:
+        runtime.approve_and_save(engine, node_id, note=note)
+    except ApprovalNotPermitted as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
     console.print(f"[green]approved[/green] {node_id} on run {run_id}")
     console.print(f"  agentic resume {run_id}")
 
@@ -141,9 +274,11 @@ def reject(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from None
 
-    assert engine.state is not None
-    engine.reject_approval(node_id, note=note)
-    engine.store.save(engine.state)
+    try:
+        runtime.reject_and_save(engine, node_id, note=note)
+    except ApprovalNotPermitted as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
     console.print(f"[yellow]rejected[/yellow] {node_id} on run {run_id}")
 
 
@@ -222,9 +357,21 @@ def lineage(
 def replan(
     run_id: str = typer.Argument(...),
     node: str = typer.Option(..., "--node", help="Node id whose changed output triggers the re-plan."),
-    input: str = typer.Option(..., "--input", help="Revised guidance / clarification answer."),
+    input: str = typer.Option(
+        "", "--input", help="Revised guidance / clarification answer. Required unless --from-rejection."
+    ),
+    from_rejection: bool = typer.Option(
+        False, "--from-rejection",
+        help=(
+            "Recover a REJECTED approval gate: re-opens the nodes it depends_on with its stored "
+            "rejection note attached, then returns it to PENDING. Distinct from the --input path "
+            "(input-hash-mismatch replan) in the audit trail."
+        ),
+    ),
 ) -> None:
-    """Trigger an explicit dynamic re-plan of a run."""
+    """Trigger an explicit re-plan of a run — either from revised
+    upstream guidance (--input) or from an operator recovering a
+    REJECTED approval gate (--from-rejection)."""
     try:
         engine = runtime.load_engine(run_id)
     except runtime.UnknownRun as exc:
@@ -232,6 +379,21 @@ def replan(
         raise typer.Exit(code=1) from None
 
     assert engine.state is not None
+
+    if from_rejection:
+        try:
+            asyncio.run(engine.replan_from_rejection(node))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator, not a crash
+            console.print(f"[red]replan failed: {exc}[/red]")
+            raise typer.Exit(code=1) from None
+        console.print(f"[green]recovered[/green] {node} from rejection on run {run_id}")
+        console.print(f"  agentic resume {run_id}")
+        return
+
+    if not input:
+        console.print("[red]--input is required unless --from-rejection is set[/red]")
+        raise typer.Exit(code=1)
+
     artifact_name = "clarification_answer" if node == "req.clarify" else f"{node}_replan_input"
     payload = {"text": input}
     engine.context.put(Artifact(
@@ -322,14 +484,44 @@ def approvals_show(run_id: str = typer.Argument(...), node_id: str = typer.Argum
         raise typer.Exit(code=1)
 
     manager = ApprovalManager()
-    package = manager.render_package(engine.graph[node_id], node_run, engine.context)
-    console.print(f"[bold]Decision package: {node_id}[/bold] (run {run_id})")
-    console.print(f"  stage: {package.stage}")
-    console.print(f"  input_hash: {package.input_hash}")
-    console.print(f"  artifacts: {[a.name for a in package.artifacts]}")
-    for decision in package.decisions:
-        console.print(f"  decision: {decision.statement} — {decision.rationale}")
-    console.print(f"  consequence of rejection: {package.consequence_of_rejection}")
+    package = manager.render_package(
+        engine.graph[node_id], node_run, engine.context, policy_verdicts=node_run.policy_verdicts
+    )
+    console.print(render_text(package), markup=False, highlight=False)
+
+
+@approvals_app.command(name="export")
+def approvals_export(
+    run_id: str = typer.Argument(...),
+    node_id: str = typer.Argument(...),
+    format: str = typer.Option("docx", "--format", help="docx (only format currently supported)"),
+    output: str = typer.Option("", "--output", help="Output path (default: <run_id>-<node_id>.docx)"),
+) -> None:
+    """Export the same decision package `approvals show` prints as a
+    formatted Word document, for review outside the terminal."""
+    if format != "docx":
+        console.print(f"[red]unknown format: {format} (use 'docx')[/red]")
+        raise typer.Exit(code=1)
+
+    try:
+        engine = runtime.load_engine(run_id)
+    except runtime.UnknownRun as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from None
+
+    assert engine.state is not None
+    node_run = engine.state.nodes.get(node_id)
+    if node_run is None:
+        console.print(f"[red]no such node: {node_id}[/red]")
+        raise typer.Exit(code=1)
+
+    manager = ApprovalManager()
+    package = manager.render_package(
+        engine.graph[node_id], node_run, engine.context, policy_verdicts=node_run.policy_verdicts
+    )
+    out_path = Path(output) if output else Path(f"{run_id}-{node_id}.docx")
+    render_docx(package, out_path)
+    console.print(f"wrote {out_path}")
 
 
 if __name__ == "__main__":
